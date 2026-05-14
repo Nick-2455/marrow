@@ -8,8 +8,6 @@ import (
 // Sentinel errors for Engram client operations.
 var (
 	ErrEngramUnreachable = errors.New("engram: service unreachable")
-	ErrAuth              = errors.New("engram: authentication failed")
-	ErrRateLimited       = errors.New("engram: rate limited")
 	ErrNotFound          = errors.New("engram: resource not found")
 	ErrInvalidResponse   = errors.New("engram: invalid response from server")
 )
@@ -18,6 +16,16 @@ var (
 var (
 	ErrTriageNotFound = errors.New("store: triage position not found")
 	ErrCacheMiss      = errors.New("store: cache miss")
+)
+
+// Sentinel errors for graph store operations.
+var (
+	ErrNodeNotFound      = errors.New("graph: node not found")
+	ErrDuplicateNode     = errors.New("graph: node with same name already exists")
+	ErrDomainNotEmpty    = errors.New("graph: cannot delete domain with active subareas")
+	ErrEngramUnavail     = errors.New("graph: engram unavailable, writes rejected")
+	ErrSessionNotFound   = errors.New("graph: session not found")
+	ErrLearningNotFound  = errors.New("graph: learning not found")
 )
 
 // Sentinel errors for config operations.
@@ -38,11 +46,6 @@ func (e *ErrRetryExceeded) Error() string {
 
 func (e *ErrRetryExceeded) Unwrap() error {
 	return e.LastErr
-}
-
-// IsAuthError reports whether err is an authentication-related error.
-func IsAuthError(err error) bool {
-	return errors.Is(err, ErrAuth)
 }
 
 // IsNotFoundError reports whether err indicates a missing resource.

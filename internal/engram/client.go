@@ -1,295 +1,529 @@
 package engram
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/Nick-2455/marrow/internal/domain"
 )
 
 const (
-	defaultTimeout = 10 * time.Second
+	defaultEngramBin = "engram"
+	callTimeout      = 10 * time.Second
 )
 
-// HTTPClient is the HTTP-based implementation of domain.EngramClient.
-type HTTPClient struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+// MCPClient implements domain.EngramClient via MCP stdio to engram.
+type MCPClient struct {
+	client *client.Client
+	mu     sync.Mutex
+	closed bool
 }
 
-// NewHTTPClient creates a new Engram client.
-func NewHTTPClient(baseURL, apiKey string) *HTTPClient {
-	return &HTTPClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		httpClient: &http.Client{
-			Timeout: defaultTimeout,
-		},
+// NewClient creates a new MCP client that spawns "engram mcp --tools=agent".
+// If engramPath is empty, "engram" is used (resolved from PATH).
+func NewClient(engramPath string) (*MCPClient, error) {
+	if engramPath == "" {
+		engramPath = defaultEngramBin
 	}
+
+	c, err := client.NewStdioMCPClient(engramPath, nil, "mcp", "--tools=agent")
+	if err != nil {
+		return nil, fmt.Errorf("engram: create stdio client: %w", err)
+	}
+
+	// Initialize the MCP connection
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{
+		Name:    "marrow",
+		Version: "0.1.0",
+	}
+
+	if _, err := c.Initialize(ctx, initReq); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("engram: initialize: %w", err)
+	}
+
+	return &MCPClient{client: c}, nil
 }
 
-// CreateResource creates a new resource in Engram.
-func (c *HTTPClient) CreateResource(ctx context.Context, r domain.Resource) (string, error) {
-	payload := map[string]any{
-		"type": "resource",
-		"content": map[string]any{
-			"url":     r.URL,
-			"title":   r.Title,
-			"content": r.Content,
-			"bucket":  string(r.Bucket),
-		},
+// CreateResource creates a new resource in Engram via mem_save.
+// Each resource is a unique observation — no topic_key is used to avoid upserts.
+func (c *MCPClient) CreateResource(ctx context.Context, r domain.Resource) (string, error) {
+	contentMap := map[string]string{
+		"url":    r.URL,
+		"title":  r.Title,
+		"bucket": string(r.Bucket),
 	}
-
-	body, err := json.Marshal(payload)
+	if r.Content != "" {
+		contentMap["content"] = r.Content
+	}
+	contentBytes, err := json.Marshal(contentMap)
 	if err != nil {
-		return "", fmt.Errorf("engram: marshal create payload: %w", err)
+		return "", fmt.Errorf("engram: marshal content: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url("/observations"), bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("engram: create request: %w", err)
-	}
-
-	resp, err := c.doWithRetry(ctx, req)
+	result, err := c.callTool(ctx, "mem_save", map[string]any{
+		"title":   r.Title,
+		"content": string(contentBytes),
+		"type":    "resource",
+		"project": "marrow",
+	})
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	var obs Observation
-	if err := json.NewDecoder(resp.Body).Decode(&obs); err != nil {
-		return "", fmt.Errorf("engram: decode response: %w", err)
-	}
-
-	return obs.ID, nil
+	// Parse the observation ID from the response text
+	text := extractText(result)
+	return parseObservationID(text), nil
 }
 
-// GetResource retrieves a resource by ID.
-func (c *HTTPClient) GetResource(ctx context.Context, id string) (domain.Resource, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/observations/"+id), nil)
-	if err != nil {
-		return domain.Resource{}, fmt.Errorf("engram: create request: %w", err)
-	}
-
-	resp, err := c.doWithRetry(ctx, req)
+// GetResource retrieves a resource by ID via mem_get_observation.
+func (c *MCPClient) GetResource(ctx context.Context, id string) (domain.Resource, error) {
+	numID, err := parseIDToNumber(id)
 	if err != nil {
 		return domain.Resource{}, err
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var obs Observation
-	if err := json.NewDecoder(resp.Body).Decode(&obs); err != nil {
-		return domain.Resource{}, fmt.Errorf("engram: decode response: %w", err)
+	result, err := c.callTool(ctx, "mem_get_observation", map[string]any{
+		"id": numID,
+	})
+	if err != nil {
+		return domain.Resource{}, err
 	}
 
-	return observationToResource(obs), nil
+	return parseResourceFromText(extractText(result))
 }
 
-// SearchResources searches for resources using FTS5.
-func (c *HTTPClient) SearchResources(ctx context.Context, query string) ([]domain.Resource, error) {
-	reqURL := c.url("/observations/search")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("engram: create request: %w", err)
-	}
-
-	q := req.URL.Query()
-	q.Set("q", query)
-	req.URL.RawQuery = q.Encode()
-
-	resp, err := c.doWithRetry(ctx, req)
+// SearchResources searches for resources using mem_search.
+func (c *MCPClient) SearchResources(ctx context.Context, query string) ([]domain.Resource, error) {
+	result, err := c.callTool(ctx, "mem_search", map[string]any{
+		"query":   query,
+		"project": "marrow",
+		"type":    "resource",
+		"limit":   50,
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	var searchResp SearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
-		return nil, fmt.Errorf("engram: decode search response: %w", err)
-	}
-
-	resources := make([]domain.Resource, 0, len(searchResp.Results))
-	for _, obs := range searchResp.Results {
-		resources = append(resources, observationToResource(obs))
-	}
-
-	return resources, nil
+	return parseSearchResults(extractText(result))
 }
 
-// GetRoadmap returns all resources grouped by bucket.
-func (c *HTTPClient) GetRoadmap(ctx context.Context) (map[domain.Bucket][]domain.Resource, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/observations/roadmap"), nil)
+// SaveNode creates or updates a node in Engram with type and topic_key.
+// Returns the Engram observation ID.
+func (c *MCPClient) SaveNode(ctx context.Context, nodeType, title string, content map[string]any, topicKey string) (string, error) {
+	contentBytes, err := json.Marshal(content)
 	if err != nil {
-		return nil, fmt.Errorf("engram: create request: %w", err)
+		return "", fmt.Errorf("engram: marshal node content: %w", err)
 	}
 
-	resp, err := c.doWithRetry(ctx, req)
+	result, err := c.callTool(ctx, "mem_save", map[string]any{
+		"title":     title,
+		"content":   string(contentBytes),
+		"type":      nodeType,
+		"topic_key": topicKey,
+		"project":   "marrow",
+	})
+	if err != nil {
+		return "", err
+	}
+
+	text := extractText(result)
+	return parseObservationID(text), nil
+}
+
+// UpdateNode updates a node's content by Engram observation ID.
+func (c *MCPClient) UpdateNode(ctx context.Context, engramID string, content map[string]any) error {
+	contentBytes, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("engram: marshal update content: %w", err)
+	}
+
+	numID, err := parseIDToNumber(engramID)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.callTool(ctx, "mem_update", map[string]any{
+		"id":      numID,
+		"content": string(contentBytes),
+	})
+	return err
+}
+
+// SearchNodes searches for nodes by query and optional type filter.
+// Returns parsed observation IDs and titles from Engram search results.
+func (c *MCPClient) SearchNodes(ctx context.Context, query, nodeType string) ([]domain.GraphNode, error) {
+	args := map[string]any{
+		"query":   query,
+		"project": "marrow",
+		"limit":   50,
+	}
+	if nodeType != "" {
+		args["type"] = nodeType
+	}
+
+	result, err := c.callTool(ctx, "mem_search", args)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	var groups map[string][]Observation
-	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
-		return nil, fmt.Errorf("engram: decode roadmap response: %w", err)
+	return parseGraphNodeResults(extractText(result))
+}
+
+// UpdateResource updates fields of an existing resource via mem_update.
+func (c *MCPClient) UpdateResource(ctx context.Context, id string, updates map[string]any) error {
+	// Build a content JSON string from the updates
+	contentBytes, err := json.Marshal(updates)
+	if err != nil {
+		return fmt.Errorf("engram: marshal updates: %w", err)
 	}
 
-	result := make(map[domain.Bucket][]domain.Resource)
-	for bucketKey, observations := range groups {
-		bucket := domain.Bucket(bucketKey)
-		for _, obs := range observations {
-			result[bucket] = append(result[bucket], observationToResource(obs))
+	numID, err := parseIDToNumber(id)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.callTool(ctx, "mem_update", map[string]any{
+		"id":      numID,
+		"content": string(contentBytes),
+	})
+	return err
+}
+
+// IsReachable checks if the MCP client process is alive.
+func (c *MCPClient) IsReachable(ctx context.Context) bool {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
+	c.mu.Unlock()
+
+	// Try a lightweight tool call to verify connectivity
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	_, err := c.callTool(pingCtx, "mem_search", map[string]any{
+		"query": "",
+		"limit": 1,
+	})
+	return err == nil
+}
+
+// Close shuts down the MCP client and its subprocess.
+func (c *MCPClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	return c.client.Close()
+}
+
+// callTool executes an MCP tool call with a timeout.
+func (c *MCPClient) callTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("engram: client closed")
+	}
+	c.mu.Unlock()
+
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = name
+	req.Params.Arguments = args
+
+	result, err := c.client.CallTool(callCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("engram: call %s: %w", name, err)
+	}
+
+	if result.IsError {
+		text := extractText(result)
+		if text == "" {
+			text = "unknown error"
 		}
+		return nil, fmt.Errorf("engram: tool %s error: %s", name, text)
 	}
 
 	return result, nil
 }
 
-// UpdateResource updates fields of an existing resource.
-func (c *HTTPClient) UpdateResource(ctx context.Context, id string, updates map[string]any) error {
-	payload := map[string]any{
-		"content": updates,
+// extractText pulls the first text content from a CallToolResult.
+func extractText(result *mcp.CallToolResult) string {
+	if result == nil || len(result.Content) == 0 {
+		return ""
 	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("engram: marshal update payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.url("/observations/"+id), bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("engram: create request: %w", err)
-	}
-
-	resp, err := c.doWithRetry(ctx, req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("engram: update failed with status %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-// IsReachable checks if the Engram service is responding.
-func (c *HTTPClient) IsReachable(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/health"), nil)
-	if err != nil {
-		return false
-	}
-
-	resp, err := c.doWithRetry(ctx, req)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return resp.StatusCode == http.StatusOK
-}
-
-// doOnce executes an HTTP request with auth headers and error handling (no retry).
-func (c *HTTPClient) doOnce(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, wrapNetworkError(err)
-	}
-
-	switch resp.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		_ = resp.Body.Close()
-		return nil, domain.ErrAuth
-	case http.StatusTooManyRequests:
-		_ = resp.Body.Close()
-		return nil, domain.ErrRateLimited
-	case http.StatusNotFound:
-		_ = resp.Body.Close()
-		return nil, domain.ErrNotFound
-	}
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: status %d: %s", domain.ErrInvalidResponse, resp.StatusCode, string(body))
-	}
-
-	return resp, nil
-}
-
-// doWithRetry executes an HTTP request with exponential backoff on transient errors.
-// Does NOT retry on auth, not-found, or rate-limit errors.
-func (c *HTTPClient) doWithRetry(ctx context.Context, req *http.Request) (*http.Response, error) {
-	var resp *http.Response
-	err := Retry(ctx, func() error {
-		var rErr error
-		resp, rErr = c.doOnce(req)
-		if rErr == nil {
-			return nil
+	for _, c := range result.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			return tc.Text
 		}
-		if errors.Is(rErr, domain.ErrAuth) || errors.Is(rErr, domain.ErrNotFound) || errors.Is(rErr, domain.ErrRateLimited) {
-			// Non-retryable — wrap so Retry will propagate it immediately
-			return fmt.Errorf("non-retryable: %w", rErr)
+	}
+	return ""
+}
+
+// parseObservationID extracts an observation ID from mem_save response text.
+// Engram mem_save returns a JSON object with an "id" field:
+//
+//	{"id":131,"project":"marrow","result":"Memory saved: ..."}
+//
+// Falls back to extracting #<number> from plain text for older Engram versions.
+func parseObservationID(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return text
+	}
+
+	// Primary path: parse JSON response and extract "id" field.
+	var wrapper struct {
+		ID json.Number `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(text), &wrapper); err == nil && wrapper.ID.String() != "" {
+		return wrapper.ID.String()
+	}
+
+	// Fallback: find "#<number>" pattern (older Engram versions).
+	if idx := strings.Index(text, "#"); idx >= 0 {
+		rest := text[idx+1:]
+		// Take digits and stop at first non-digit
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
 		}
-		return rErr
-	})
-	if err != nil {
-		// Unwrap non-retryable errors to preserve original sentinel
-		var retryErr *RetryExceededError
-		if errors.As(err, &retryErr) {
-			return nil, retryErr
+		if end > 0 {
+			return rest[:end]
 		}
-		return resp, nil
 	}
-	return resp, nil
+	return strings.TrimSpace(text)
 }
 
-// url builds a full URL from a path.
-func (c *HTTPClient) url(path string) string {
-	return c.baseURL + path
+// parseResourceFromText parses a single resource from mem_get_observation response text.
+// The response is JSON: {"project":"marrow","result":"#131 [resource] prueba1\n{...}\n..."}
+func parseResourceFromText(text string) (domain.Resource, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return domain.Resource{}, fmt.Errorf("engram: empty response")
+	}
+
+	// Parse outer JSON wrapper
+	var wrapper struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(text), &wrapper); err == nil && wrapper.Result != "" {
+		return parseMemoryBlock(wrapper.Result), nil
+	}
+
+	// Fallback: treat as raw memory block
+	r := parseMemoryBlock(text)
+	if r.ID == "" && r.Title == "" {
+		return domain.Resource{}, fmt.Errorf("engram: could not parse resource from text")
+	}
+	return r, nil
 }
 
-// wrapNetworkError wraps network-level errors appropriately.
-func wrapNetworkError(err error) error {
-	return fmt.Errorf("%w: %v", domain.ErrEngramUnreachable, err)
+// parseSearchResults parses mem_search text results into []domain.Resource.
+// The response text is a JSON object: {"project":"marrow","result":"Found N memories:\n\n..."}
+// The result field contains memory blocks with ID, type, title, and content JSON.
+func parseSearchResults(text string) ([]domain.Resource, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return []domain.Resource{}, nil
+	}
+
+	// Parse outer JSON wrapper
+	var wrapper struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(text), &wrapper); err != nil {
+		return nil, fmt.Errorf("engram: parse search wrapper: %w", err)
+	}
+
+	if wrapper.Result == "" {
+		return []domain.Resource{}, nil
+	}
+
+	return parseMemoryBlocks(wrapper.Result), nil
 }
 
-// observationToResource converts an Engram Observation to a domain Resource.
-func observationToResource(obs Observation) domain.Resource {
-	content := obs.Content
-	if content == nil {
-		content = make(map[string]interface{})
+// parseMemoryBlocks extracts resource entries from Engram's search result text.
+// Format: "[N] #ID (type) — title\n    {content JSON}\n    metadata..."
+func parseMemoryBlocks(text string) []domain.Resource {
+	var resources []domain.Resource
+
+	// Each memory block is separated by a blank line
+	blocks := strings.Split(text, "\n\n")
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+
+		r := parseMemoryBlock(block)
+		if r.ID != "" || r.Title != "" {
+			resources = append(resources, r)
+		}
 	}
 
-	r := domain.Resource{
-		ID:        obs.ID,
-		CreatedAt: obs.CreatedAt,
-		UpdatedAt: obs.UpdatedAt,
-	}
+	return resources
+}
 
-	if v, ok := content["url"].(string); ok {
-		r.URL = v
-	}
-	if v, ok := content["title"].(string); ok {
-		r.Title = v
-	}
-	if v, ok := content["content"].(string); ok {
-		r.Content = v
-	}
-	if v, ok := content["bucket"].(string); ok {
-		r.Bucket = domain.Bucket(v)
+// parseMemoryBlock parses a single memory block into a domain.Resource.
+func parseMemoryBlock(block string) domain.Resource {
+	var r domain.Resource
+	lines := strings.Split(block, "\n")
+
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Line 0: "[1] #131 (resource) — prueba1"
+		if i == 0 {
+			r = parseHeaderLine(line)
+			continue
+		}
+
+		// Try to parse as JSON content
+		if strings.HasPrefix(line, "{") {
+			parseContentLine(line, &r)
+			continue
+		}
 	}
 
 	return r
+}
+
+// parseHeaderLine extracts ID, type, and title from "[1] #131 (resource) — prueba1"
+func parseHeaderLine(line string) domain.Resource {
+	var r domain.Resource
+
+	// Extract "#ID" 
+	if idx := strings.Index(line, "#"); idx >= 0 {
+		rest := line[idx+1:]
+		if space := strings.IndexAny(rest, " \t("); space > 0 {
+			r.ID = rest[:space]
+		}
+	}
+
+	// Extract title after "—"
+	if idx := strings.Index(line, "—"); idx >= 0 {
+		r.Title = strings.TrimSpace(line[idx+len("—"):])
+	}
+
+	return r
+}
+
+// parseContentLine parses the JSON content line and updates the resource.
+func parseContentLine(line string, r *domain.Resource) {
+	var content map[string]string
+	if err := json.Unmarshal([]byte(line), &content); err != nil {
+		return
+	}
+
+	if url, ok := content["url"]; ok {
+		r.URL = url
+	}
+	if title, ok := content["title"]; ok {
+		r.Title = title
+	}
+	if bucket, ok := content["bucket"]; ok {
+		r.Bucket = domain.Bucket(bucket)
+	}
+}
+
+// parseIDToNumber converts a string observation ID (e.g. "131") to a float64
+// for use with Engram MCP tools that expect numeric IDs (mem_get_observation, mem_update).
+func parseIDToNumber(id string) (float64, error) {
+	n, err := strconv.ParseFloat(id, 64)
+	if err != nil {
+		return 0, fmt.Errorf("engram: invalid observation ID %q: %w", id, err)
+	}
+	return n, nil
+}
+
+// parseGraphNodeResults parses mem_search text results into []domain.GraphNode.
+// The response text follows the same format as resource search results.
+func parseGraphNodeResults(text string) ([]domain.GraphNode, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return []domain.GraphNode{}, nil
+	}
+
+	// Parse outer JSON wrapper
+	var wrapper struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(text), &wrapper); err != nil {
+		return nil, fmt.Errorf("engram: parse graph search wrapper: %w", err)
+	}
+
+	if wrapper.Result == "" {
+		return []domain.GraphNode{}, nil
+	}
+
+	// Parse memory blocks — each block has header line with #ID (type) — title
+	var nodes []domain.GraphNode
+	blocks := strings.Split(wrapper.Result, "\n\n")
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+
+		lines := strings.Split(block, "\n")
+		if len(lines) == 0 {
+			continue
+		}
+
+		// Parse header: "[1] #131 (domain) — Backend Development"
+		header := lines[0]
+		var node domain.GraphNode
+
+		// Extract ID
+		if idx := strings.Index(header, "#"); idx >= 0 {
+			rest := header[idx+1:]
+			if space := strings.IndexAny(rest, " \t("); space > 0 {
+				node.EngramID = rest[:space]
+			}
+		}
+
+		// Extract type
+		if start := strings.Index(header, "("); start >= 0 {
+			end := strings.Index(header[start:], ")")
+			if end > 0 {
+				nodeType := header[start+1 : start+end]
+				node.NodeType = domain.NodeType(nodeType)
+			}
+		}
+
+		// Extract title after "—"
+		if idx := strings.Index(header, "—"); idx >= 0 {
+			node.Title = strings.TrimSpace(header[idx+len("—"):])
+		}
+
+		node.Active = true // Default to active for search results
+
+		if node.EngramID != "" || node.Title != "" {
+			nodes = append(nodes, node)
+		}
+	}
+
+	return nodes, nil
 }
