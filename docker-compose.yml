@@ -1,0 +1,14 @@
+services:
+  marrow:
+    build: .
+    stdin_open: true
+    tty: true
+    environment:
+      - TERM=xterm-256color
+    volumes:
+      - marrow_data:/root/.local/share/marrow
+      - marrow_config:/root/.config/marrow
+
+volumes:
+  marrow_data:
+  marrow_config:
